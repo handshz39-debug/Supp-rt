@@ -132,7 +132,7 @@ def load_warns():
     return safe_json_load(WARNS_FILE, {})
 
 def save_warns(data):
-    safe_json_sAVE(WARNS_FILE, data)
+    safe_json_save(WARNS_FILE, data)  # Исправлено: было safe_json_sAVE
 
 def load_temp_warns():
     return safe_json_load(TEMP_WARNS_FILE, {})
@@ -798,9 +798,11 @@ async def on_command_error(ctx, error):
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
+    if TOKEN == "ВАШ_ТОКЕН_ВСТАВЬТЕ_СЮДА" or TOKEN == "":
         print("=" * 50)
         print("⚠️ ВНИМАНИЕ: Токен не установлен!")
         print("Установите переменную окружения BOT_TOKEN")
         print("Или впишите токен в переменную TOKEN в коде")
         print("=" * 50)
-        bot.run('BOT_TOKEN')
+    else:
+        bot.run(TOKEN)
