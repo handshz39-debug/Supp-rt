@@ -1,0 +1,797 @@
+import disnake
+from disnake.ext import commands, tasks
+import asyncio
+import json
+import os
+import re
+from datetime import datetime, timedelta
+
+# ==================== КОНФИГУРАЦИЯ ====================
+TOKEN = os.getenv("BOT_TOKEN")
+PREFIX = "!"
+
+# Цвета
+COLOR_DEFAULT = 0x6A0DAD
+COLOR_ERROR = 0x8B0000
+COLOR_SUCCESS = 0x6A0DAD
+COLOR_INFO = 0x9B59B6
+COLOR_WARNING = 0xE67E22
+
+# Файлы
+DATA_FILE = "user_roles_backup.json"
+MUTE_FILE = "temp_mutes.json"
+KBAN_FILE = "temp_kbans.json"
+TICKETS_FILE = "tickets.json"
+CONFIG_FILE = "bot_config.json"
+WARNS_FILE = "warns.json"
+TEMP_WARNS_FILE = "temp_warns.json"
+
+# Настройки
+BLOCKED_ROLE_NAME = "заблокированный доступ"
+WARN_DURATION_HOURS = 1
+
+# ==================== БЕЗОПАСНАЯ РАБОТА С JSON ====================
+def safe_json_load(file_path, default_data=None):
+    if default_data is None:
+        default_data = {}
+    
+    if not os.path.exists(file_path):
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(default_data, f, ensure_ascii=False, indent=4)
+        return default_data
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                raise json.JSONDecodeError("Empty file", content, 0)
+            return json.loads(content)
+    except (json.JSONDecodeError, FileNotFoundError):
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(default_data, f, ensure_ascii=False, indent=4)
+        return default_data
+
+def safe_json_save(file_path, data):
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        return True
+    except Exception as e:
+        print(f"Ошибка сохранения {file_path}: {e}")
+        return False
+
+# Intents
+intents = disnake.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.guilds = True
+intents.messages = True
+intents.bans = True
+intents.moderation = True
+intents.voice_states = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+# ==================== РАБОТА С КОНФИГУРАЦИЕЙ ====================
+def load_config():
+    return safe_json_load(CONFIG_FILE, {
+        "moderation_roles": [],
+        "admin_roles": [],
+        "ticket_categories": [],
+        "support_role": None,
+        "log_ban": None,
+        "log_mute": None,
+        "log_ticket": None,
+        "log_kban": None,
+        "log_message": None,
+        "log_role": None,
+        "log_warn": None,
+        "startup_log": None
+    })
+
+def save_config(config):
+    safe_json_save(CONFIG_FILE, config)
+
+def get_config_value(key, default=None):
+    config = load_config()
+    return config.get(key, default)
+
+def set_config_value(key, value):
+    config = load_config()
+    config[key] = value
+    save_config(config)
+    return value
+
+# ==================== ФУНКЦИИ ЗАГРУЗКИ ====================
+def load_user_roles():
+    return safe_json_load(DATA_FILE, {})
+
+def save_user_roles(data):
+    safe_json_save(DATA_FILE, data)
+
+def load_temp_data(file_name):
+    return safe_json_load(file_name, {})
+
+def save_temp_data(file_name, data):
+    safe_json_save(file_name, data)
+
+def load_tickets():
+    return safe_json_load(TICKETS_FILE, {})
+
+def save_tickets(data):
+    safe_json_save(TICKETS_FILE, data)
+
+def load_warns():
+    return safe_json_load(WARNS_FILE, {})
+
+def save_warns(data):
+    safe_json_save(WARNS_FILE, data)
+
+def load_temp_warns():
+    return safe_json_load(TEMP_WARNS_FILE, {})
+
+def save_temp_warns(data):
+    safe_json_save(TEMP_WARNS_FILE, data)
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+def parse_time(time_str):
+    if time_str is None:
+        return None
+    time_str_lower = time_str.lower().strip()
+    if time_str_lower in ["навсегда", "forever", "∞", "бесконечно"]:
+        return None
+    time_units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+    match = re.match(r'(\d+)([smhdw])', time_str_lower)
+    if not match:
+        return None
+    amount, unit = match.groups()
+    return int(amount) * time_units[unit]
+
+def format_duration(seconds):
+    if seconds is None:
+        return "Навсегда"
+    if seconds == 0:
+        return "Навсегда"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days} дн.")
+    if hours > 0:
+        parts.append(f"{hours} ч.")
+    if minutes > 0:
+        parts.append(f"{minutes} мин.")
+    if secs > 0:
+        parts.append(f"{secs} сек.")
+    return " ".join(parts) if parts else "0 сек."
+
+def check_hierarchy(ctx, member):
+    if ctx.author == ctx.guild.owner:
+        return True
+    if ctx.author.top_role <= member.top_role:
+        return False
+    return True
+
+def has_moderator_permissions(member):
+    if member.guild_permissions.administrator:
+        return True
+    if member.guild_permissions.manage_messages:
+        return True
+    moderation_roles = get_config_value("moderation_roles", [])
+    admin_roles = get_config_value("admin_roles", [])
+    for role in member.roles:
+        if role.id in moderation_roles or role.id in admin_roles:
+            return True
+    return False
+
+def has_ban_permissions(member):
+    return member.guild_permissions.ban_members or member.guild_permissions.administrator
+
+def has_admin_permissions(member):
+    return member.guild_permissions.administrator
+
+async def send_dm(user, embed):
+    try:
+        await user.send(embed=embed)
+    except:
+        pass
+
+# ==================== EMBED ФУНКЦИИ ====================
+async def create_error_embed(title: str, description: str):
+    embed = disnake.Embed(title=f"❌ {title}", description=description, color=COLOR_ERROR, timestamp=datetime.now())
+    return embed
+
+async def create_success_embed(title: str, description: str):
+    embed = disnake.Embed(title=f"✅ {title}", description=description, color=COLOR_SUCCESS, timestamp=datetime.now())
+    return embed
+
+async def create_info_embed(title: str, description: str, color=COLOR_INFO):
+    embed = disnake.Embed(title=f"ℹ️ {title}", description=description, color=color, timestamp=datetime.now())
+    return embed
+
+# ==================== ФУНКЦИИ ЛОГИРОВАНИЯ ====================
+async def send_log(guild, log_type, embed):
+    channel_id = get_config_value(log_type)
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel:
+            try:
+                await channel.send(embed=embed)
+                return True
+            except:
+                pass
+    return False
+
+async def log_ban(guild, moderator, target, reason, duration):
+    embed = disnake.Embed(title="🔨 БАН", color=COLOR_ERROR, timestamp=datetime.now())
+    embed.add_field(name="🛡️ Модератор", value=moderator.mention, inline=True)
+    embed.add_field(name="👤 Пользователь", value=f"{target} (ID: {target.id})", inline=True)
+    embed.add_field(name="📋 Причина", value=reason, inline=False)
+    if duration:
+        embed.add_field(name="⏱️ Длительность", value=duration, inline=True)
+    await send_log(guild, "log_ban", embed)
+
+async def log_mute(guild, moderator, target, reason, duration):
+    embed = disnake.Embed(title="🔇 МЬЮТ", color=COLOR_WARNING, timestamp=datetime.now())
+    embed.add_field(name="🛡️ Модератор", value=moderator.mention, inline=True)
+    embed.add_field(name="👤 Пользователь", value=target.mention, inline=True)
+    embed.add_field(name="⏱️ Длительность", value=duration, inline=True)
+    embed.add_field(name="📋 Причина", value=reason, inline=False)
+    await send_log(guild, "log_mute", embed)
+
+async def log_warn(guild, moderator, target, warn_id, reason, duration):
+    embed = disnake.Embed(title="⚠️ ПРЕДУПРЕЖДЕНИЕ", color=COLOR_WARNING, timestamp=datetime.now())
+    embed.add_field(name="🛡️ Модератор", value=moderator.mention, inline=True)
+    embed.add_field(name="👤 Пользователь", value=target.mention, inline=True)
+    embed.add_field(name="🆔 ID", value=f"#{warn_id}", inline=True)
+    embed.add_field(name="⏱️ Снимется через", value=duration, inline=True)
+    embed.add_field(name="📋 Причина", value=reason, inline=False)
+    await send_log(guild, "log_warn", embed)
+
+# ==================== ПРОВЕРКА ПРАВ ====================
+async def check_permissions(ctx, permission_type: str):
+    if permission_type == "moderator":
+        if has_moderator_permissions(ctx.author):
+            return True
+        embed = await create_error_embed("Недостаточно прав!", "Вам требуется право **Управлять сообщениями** или **Администратор**")
+        await ctx.send(embed=embed, delete_after=10)
+        return False
+    elif permission_type == "ban":
+        if has_ban_permissions(ctx.author):
+            return True
+        embed = await create_error_embed("Недостаточно прав!", "Вам требуется право **Банить участников**")
+        await ctx.send(embed=embed, delete_after=10)
+        return False
+    elif permission_type == "admin":
+        if has_admin_permissions(ctx.author):
+            return True
+        embed = await create_error_embed("Недостаточно прав!", "Вам требуется право **Администратор**")
+        await ctx.send(embed=embed, delete_after=10)
+        return False
+    return False
+
+# ==================== ПРЕДУПРЕЖДЕНИЯ ====================
+def get_user_warns(guild_id: int, user_id: int):
+    warns = load_warns()
+    key = f"{guild_id}_{user_id}"
+    if key not in warns:
+        warns[key] = []
+        save_warns(warns)
+    return warns[key], warns
+
+def add_warn(guild_id: int, user_id: int, moderator_id: int, reason: str):
+    user_warns, all_warns = get_user_warns(guild_id, user_id)
+    warn_id = len(user_warns) + 1
+    warn_data = {
+        "id": warn_id,
+        "moderator_id": moderator_id,
+        "reason": reason,
+        "date": datetime.now().isoformat(),
+        "timestamp": datetime.now().timestamp()
+    }
+    user_warns.append(warn_data)
+    key = f"{guild_id}_{user_id}"
+    all_warns[key] = user_warns
+    save_warns(all_warns)
+    
+    temp_warns = load_temp_warns()
+    temp_key = f"{guild_id}_{user_id}_{warn_id}"
+    temp_warns[temp_key] = {
+        "guild_id": guild_id,
+        "user_id": user_id,
+        "warn_id": warn_id,
+        "expires_at": datetime.now().timestamp() + (WARN_DURATION_HOURS * 3600)
+    }
+    save_temp_warns(temp_warns)
+    
+    return warn_id, len(user_warns)
+
+def remove_warn(guild_id: int, user_id: int, warn_id: int):
+    user_warns, all_warns = get_user_warns(guild_id, user_id)
+    for i, warn in enumerate(user_warns):
+        if warn["id"] == warn_id:
+            removed_warn = user_warns.pop(i)
+            for j, w in enumerate(user_warns, 1):
+                w["id"] = j
+            key = f"{guild_id}_{user_id}"
+            all_warns[key] = user_warns
+            save_warns(all_warns)
+            
+            temp_warns = load_temp_warns()
+            temp_key = f"{guild_id}_{user_id}_{warn_id}"
+            if temp_key in temp_warns:
+                del temp_warns[temp_key]
+                save_temp_warns(temp_warns)
+            
+            return removed_warn
+    return None
+
+# ==================== КОМАНДЫ ====================
+@bot.command(name="пред", aliases=["warn"])
+async def warn_user(ctx, member: disnake.Member, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    if not check_hierarchy(ctx, member):
+        embed = await create_error_embed("Ошибка иерархии", "Вы не можете выдать предупреждение пользователю с ролью выше или равной вашей!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    if member == ctx.author:
+        embed = await create_error_embed("Ошибка", "Вы не можете выдать предупреждение самому себе!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    warn_id, total_warns = add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
+    
+    embed_dm = disnake.Embed(title="⚠️ Вы получили предупреждение", description=f"На сервере **{ctx.guild.name}**", color=COLOR_WARNING, timestamp=datetime.now())
+    embed_dm.add_field(name="🆔 ID", value=f"#{warn_id}", inline=True)
+    embed_dm.add_field(name="📊 Всего", value=f"{total_warns}", inline=True)
+    embed_dm.add_field(name="⏱️ Снимется через", value=f"{WARN_DURATION_HOURS} час(а/ов)", inline=True)
+    embed_dm.add_field(name="📋 Причина", value=reason, inline=False)
+    await send_dm(member, embed_dm)
+    
+    await log_warn(ctx.guild, ctx.author, member, warn_id, reason, f"{WARN_DURATION_HOURS} час(а/ов)")
+    
+    embed = disnake.Embed(title="⚠️ Предупреждение выдано", description=f"{member.mention} получил предупреждение #{warn_id}", color=COLOR_WARNING, timestamp=datetime.now())
+    embed.add_field(name="📋 Причина", value=reason, inline=True)
+    embed.add_field(name="📊 Всего", value=f"{total_warns}", inline=True)
+    await ctx.send(embed=embed, delete_after=15)
+
+@bot.command(name="снятьпред", aliases=["unwarn"])
+async def unwarn_user(ctx, member: disnake.Member, warn_id: int, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    
+    removed_warn = remove_warn(ctx.guild.id, member.id, warn_id)
+    if not removed_warn:
+        embed = await create_error_embed("Ошибка", f"Предупреждение #{warn_id} не найдено!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    embed_dm = disnake.Embed(title="✅ Предупреждение снято", description=f"На сервере **{ctx.guild.name}**", color=COLOR_SUCCESS, timestamp=datetime.now())
+    embed_dm.add_field(name="🆔 ID", value=f"#{warn_id}", inline=True)
+    embed_dm.add_field(name="📋 Причина", value=reason, inline=False)
+    await send_dm(member, embed_dm)
+    
+    embed = await create_success_embed("Предупреждение снято", f"С {member.mention} снято предупреждение #{warn_id}")
+    await ctx.send(embed=embed, delete_after=15)
+
+@bot.command(name="преды", aliases=["warns"])
+async def list_warns(ctx, member: disnake.Member = None):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    if not member:
+        member = ctx.author
+    
+    user_warns, _ = get_user_warns(ctx.guild.id, member.id)
+    if not user_warns:
+        embed = await create_info_embed("Предупреждения", f"У {member.mention} нет предупреждений.")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    embed = disnake.Embed(title=f"⚠️ Предупреждения {member.display_name}", description=f"Всего: **{len(user_warns)}**", color=COLOR_WARNING, timestamp=datetime.now())
+    text = ""
+    for warn in user_warns:
+        mod = ctx.guild.get_member(warn["moderator_id"])
+        mod_name = mod.display_name if mod else f"ID: {warn['moderator_id']}"
+        date = datetime.fromisoformat(warn["date"]).strftime("%d.%m.%Y %H:%M")
+        text += f"**#{warn['id']}** | {date}\n└ 🛡️ {mod_name}\n└ 📋 {warn['reason'][:100]}\n\n"
+    embed.add_field(name="📋 Список", value=text[:1024], inline=False)
+    await ctx.send(embed=embed, delete_after=30)
+
+@bot.command(name="бан", aliases=["ban"])
+async def ban_user(ctx, user_input, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "ban"):
+        return
+    
+    member = None
+    
+    if user_input.isdigit():
+        user_id = int(user_input)
+        try:
+            member = await bot.fetch_user(user_id)
+        except:
+            embed = await create_error_embed("Ошибка", f"Пользователь с ID `{user_input}` не найден!")
+            await ctx.send(embed=embed, delete_after=10)
+            return
+    else:
+        try:
+            member = await commands.MemberConverter().convert(ctx, user_input)
+        except:
+            embed = await create_error_embed("Ошибка", "Пользователь не найден на сервере! Используйте ID: `!бан 1234567890 Причина`")
+            await ctx.send(embed=embed, delete_after=10)
+            return
+    
+    if isinstance(member, disnake.Member) and member == ctx.author:
+        embed = await create_error_embed("Ошибка", "Вы не можете забанить самого себя!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    if not ctx.guild.me.guild_permissions.ban_members:
+        embed = await create_error_embed("Ошибка", "У меня нет права банить!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    try:
+        if isinstance(member, disnake.Member):
+            embed_dm = disnake.Embed(title="🔨 Вы были забанены", description=f"На сервере **{ctx.guild.name}**", color=COLOR_ERROR, timestamp=datetime.now())
+            embed_dm.add_field(name="📋 Причина", value=reason, inline=True)
+            embed_dm.add_field(name="🛡️ Модератор", value=ctx.author.mention, inline=True)
+            await send_dm(member, embed_dm)
+        
+        await ctx.guild.ban(member, reason=f"{ctx.author}: {reason}")
+        await log_ban(ctx.guild, ctx.author, member, reason, None)
+        
+        embed = disnake.Embed(title="🔨 Пользователь забанен", description=f"**{member.name}** (ID: {member.id}) был забанен", color=COLOR_ERROR, timestamp=datetime.now())
+        embed.add_field(name="📋 Причина", value=reason, inline=True)
+        await ctx.send(embed=embed, delete_after=15)
+    except Exception as e:
+        embed = await create_error_embed("Ошибка", str(e)[:100])
+        await ctx.send(embed=embed, delete_after=10)
+
+@bot.command(name="разбан", aliases=["unban"])
+async def unban_user(ctx, *, user_input):
+    if not await check_permissions(ctx, "ban"):
+        return
+    
+    try:
+        banned = [e async for e in ctx.guild.bans()]
+        user = None
+        if user_input.isdigit():
+            user = await bot.fetch_user(int(user_input))
+        else:
+            for e in banned:
+                if user_input.lower() in e.user.name.lower():
+                    user = e.user
+                    break
+        if not user:
+            embed = await create_error_embed("Ошибка", "Пользователь не найден в банах!")
+            await ctx.send(embed=embed, delete_after=10)
+            return
+        
+        await ctx.guild.unban(user)
+        embed = disnake.Embed(title="✅ Пользователь разбанен", description=f"**{user.name}** разбанен", color=COLOR_SUCCESS, timestamp=datetime.now())
+        await ctx.send(embed=embed, delete_after=15)
+    except Exception as e:
+        embed = await create_error_embed("Ошибка", str(e)[:100])
+        await ctx.send(embed=embed, delete_after=10)
+
+@bot.command(name="мьют", aliases=["mute"])
+async def mute(ctx, member: disnake.Member, duration: str, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    if not check_hierarchy(ctx, member):
+        embed = await create_error_embed("Ошибка иерархии", "Нельзя выдать наказание пользователю с ролью выше или равной вашей!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    seconds = parse_time(duration)
+    if not seconds:
+        embed = await create_error_embed("Ошибка формата", "Примеры: `1d`, `2h`, `30m`, `10s`")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    role = disnake.utils.get(ctx.guild.roles, name="Muted")
+    if not role:
+        role = await ctx.guild.create_role(name="Muted")
+        for channel in ctx.guild.channels:
+            try:
+                await channel.set_permissions(role, send_messages=False, add_reactions=False, connect=False)
+            except:
+                pass
+    
+    if role in member.roles:
+        embed = await create_error_embed("Ошибка", "Пользователь уже в муте!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    await member.add_roles(role, reason=reason)
+    
+    mutes = load_temp_data(MUTE_FILE)
+    mutes[str(member.id)] = {'until': datetime.now().timestamp() + seconds, 'reason': reason}
+    save_temp_data(MUTE_FILE, mutes)
+    
+    embed_dm = disnake.Embed(title="🔇 Вы получили мут", description=f"На сервере **{ctx.guild.name}**", color=COLOR_WARNING, timestamp=datetime.now())
+    embed_dm.add_field(name="⏱️ Длительность", value=format_duration(seconds), inline=True)
+    embed_dm.add_field(name="📋 Причина", value=reason, inline=True)
+    await send_dm(member, embed_dm)
+    
+    await log_mute(ctx.guild, ctx.author, member, reason, format_duration(seconds))
+    
+    embed = disnake.Embed(title="🔇 Пользователь замучен", description=f"{member.mention} получил мут", color=COLOR_WARNING, timestamp=datetime.now())
+    embed.add_field(name="⏱️ Длительность", value=format_duration(seconds), inline=True)
+    embed.add_field(name="📋 Причина", value=reason, inline=True)
+    await ctx.send(embed=embed, delete_after=15)
+
+@bot.command(name="размьют", aliases=["unmute"])
+async def unmute(ctx, member: disnake.Member, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    
+    role = disnake.utils.get(ctx.guild.roles, name="Muted")
+    if not role or role not in member.roles:
+        embed = await create_error_embed("Ошибка", "Пользователь не в муте!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    await member.remove_roles(role, reason=reason)
+    
+    mutes = load_temp_data(MUTE_FILE)
+    if str(member.id) in mutes:
+        del mutes[str(member.id)]
+        save_temp_data(MUTE_FILE, mutes)
+    
+    embed = disnake.Embed(title="🔊 Мут снят", description=f"С {member.mention} снят мут", color=COLOR_SUCCESS, timestamp=datetime.now())
+    await ctx.send(embed=embed, delete_after=15)
+
+@bot.command(name="кбан", aliases=["kban", "block"])
+async def kban(ctx, member: disnake.Member, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "ban"):
+        return
+    if not check_hierarchy(ctx, member):
+        embed = await create_error_embed("Ошибка иерархии", "Нельзя выдать наказание пользователю с ролью выше или равной вашей!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    role = disnake.utils.get(ctx.guild.roles, name=BLOCKED_ROLE_NAME)
+    if not role:
+        role = await ctx.guild.create_role(name=BLOCKED_ROLE_NAME)
+        for channel in ctx.guild.channels:
+            try:
+                await channel.set_permissions(role, view_channel=False)
+            except:
+                pass
+    
+    if role in member.roles:
+        embed = await create_error_embed("Ошибка", "Пользователь уже в блокировке!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    roles_data = load_user_roles()
+    user_roles = [r.id for r in member.roles if r != ctx.guild.default_role and r != role]
+    roles_data[str(member.id)] = user_roles
+    save_user_roles(roles_data)
+    
+    for r in member.roles.copy():
+        if r != ctx.guild.default_role and r != role:
+            try:
+                await member.remove_roles(r)
+            except:
+                pass
+    
+    await member.add_roles(role, reason=reason)
+    
+    embed_dm = disnake.Embed(title="🔒 Вы получили блокировку доступа", description=f"На сервере **{ctx.guild.name}**", color=COLOR_ERROR, timestamp=datetime.now())
+    embed_dm.add_field(name="📋 Причина", value=reason, inline=True)
+    await send_dm(member, embed_dm)
+    
+    embed = disnake.Embed(title="🔒 Пользователь заблокирован", description=f"{member.mention} получил блокировку доступа", color=COLOR_ERROR, timestamp=datetime.now())
+    embed.add_field(name="📋 Причина", value=reason, inline=True)
+    await ctx.send(embed=embed, delete_after=15)
+
+@bot.command(name="разкбан", aliases=["unkban", "unblock"])
+async def unkban(ctx, member: disnake.Member, *, reason="Причина не указана"):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    
+    role = disnake.utils.get(ctx.guild.roles, name=BLOCKED_ROLE_NAME)
+    if not role or role not in member.roles:
+        embed = await create_error_embed("Ошибка", "Пользователь не в блокировке!")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    await member.remove_roles(role, reason=reason)
+    
+    roles_data = load_user_roles()
+    for role_id in roles_data.get(str(member.id), []):
+        r = ctx.guild.get_role(role_id)
+        if r:
+            try:
+                await member.add_roles(r)
+            except:
+                pass
+    
+    if str(member.id) in roles_data:
+        del roles_data[str(member.id)]
+        save_user_roles(roles_data)
+    
+    embed_dm = disnake.Embed(title="✅ Блокировка снята", description=f"На сервере **{ctx.guild.name}**", color=COLOR_SUCCESS, timestamp=datetime.now())
+    embed_dm.add_field(name="📋 Причина", value=reason, inline=True)
+    await send_dm(member, embed_dm)
+    
+    embed = disnake.Embed(title="✅ Блокировка снята", description=f"С {member.mention} снята блокировка", color=COLOR_SUCCESS, timestamp=datetime.now())
+    embed.add_field(name="📋 Причина", value=reason, inline=True)
+    await ctx.send(embed=embed, delete_after=15)
+
+@bot.command(name="очистить", aliases=["clear", "purge"])
+async def clear(ctx, amount: int = None):
+    if not await check_permissions(ctx, "moderator"):
+        return
+    if not amount or amount < 1:
+        embed = await create_error_embed("Ошибка", f"Укажите количество! Пример: `{PREFIX}очистить 50`")
+        await ctx.send(embed=embed, delete_after=10)
+        return
+    
+    amount = min(amount, 100)
+    try:
+        deleted = await ctx.channel.purge(limit=amount)
+        embed = disnake.Embed(title="🧹 Очистка канала", description=f"Удалено сообщений: **{len(deleted)}**", color=COLOR_SUCCESS, timestamp=datetime.now())
+        await ctx.send(embed=embed, delete_after=5)
+    except Exception as e:
+        embed = await create_error_embed("Ошибка", str(e)[:100])
+        await ctx.send(embed=embed, delete_after=10)
+
+@bot.command(name="помощь", aliases=["help"])
+async def help_cmd(ctx):
+    embed = disnake.Embed(title="📚 Помощь", description=f"Префикс: `{PREFIX}`", color=COLOR_INFO, timestamp=datetime.now())
+    embed.add_field(name="🔨 Баны", value=f"`{PREFIX}бан @user [причина]`\n`{PREFIX}разбан @user/ID`\n`{PREFIX}банлист`", inline=False)
+    embed.add_field(name="🛡️ Модерация", value=f"`{PREFIX}мьют @user 1d [причина]`\n`{PREFIX}размьют @user`\n`{PREFIX}очистить 50`", inline=False)
+    embed.add_field(name="🔒 Блокировка доступа", value=f"`{PREFIX}кбан @user [причина]`\n`{PREFIX}разкбан @user`", inline=False)
+    embed.add_field(name="⚠️ Предупреждения", value=f"`{PREFIX}пред @user [причина]`\n`{PREFIX}снятьпред @user <номер>`\n`{PREFIX}преды @user`", inline=False)
+    embed.add_field(name="ℹ️ Информация", value=f"`{PREFIX}статус`\n`{PREFIX}инфо @user`\n`{PREFIX}сервер`", inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command(name="статус", aliases=["status"])
+async def status(ctx):
+    mutes = load_temp_data(MUTE_FILE)
+    kbans = load_temp_data(KBAN_FILE)
+    tickets = load_tickets()
+    warns = load_warns()
+    total_warns = sum(len(w) for w in warns.values())
+    active = len([t for t in tickets.values() if t.get('status') == 'active'])
+    
+    embed = disnake.Embed(title="📊 Статус бота", color=COLOR_SUCCESS, timestamp=datetime.now())
+    embed.add_field(name="🤖 Бот", value=f"`{bot.user.name}`", inline=True)
+    embed.add_field(name="📡 Задержка", value=f"`{round(bot.latency * 1000)}ms`", inline=True)
+    embed.add_field(name="⚖️ Наказания", value=f"Мутов: `{len(mutes)}`\nКбанов: `{len(kbans)}`\nПредупреждений: `{total_warns}`", inline=False)
+    embed.add_field(name="🎫 Тикеты", value=f"Активных: `{active}`\nВсего: `{len(tickets)}`", inline=True)
+    await ctx.send(embed=embed, delete_after=30)
+
+@bot.command(name="инфо", aliases=["userinfo"])
+async def user_info(ctx, member: disnake.Member = None):
+    if not member:
+        member = ctx.author
+    
+    warns, _ = get_user_warns(ctx.guild.id, member.id)
+    
+    embed = disnake.Embed(title=f"ℹ️ {member.display_name}", color=member.color if member.color != disnake.Color.default() else COLOR_INFO, timestamp=datetime.now())
+    if member.avatar:
+        embed.set_thumbnail(url=member.avatar.url)
+    embed.add_field(name="👤 Имя", value=member.mention, inline=True)
+    embed.add_field(name="🆔 ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="⚠️ Предупреждения", value=f"`{len(warns)}`", inline=True)
+    embed.add_field(name="📅 Регистрация", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+    embed.add_field(name="📥 Вход", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
+    await ctx.send(embed=embed, delete_after=30)
+
+@bot.command(name="сервер", aliases=["serverinfo"])
+async def server_info(ctx):
+    g = ctx.guild
+    embed = disnake.Embed(title=f"🏢 {g.name}", description=g.description or "Нет описания", color=COLOR_INFO, timestamp=datetime.now())
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
+    embed.add_field(name="👑 Владелец", value=g.owner.mention if g.owner else "?", inline=True)
+    embed.add_field(name="🆔 ID", value=f"`{g.id}`", inline=True)
+    embed.add_field(name="👥 Участники", value=f"`{g.member_count}`", inline=True)
+    embed.add_field(name="🎭 Роли", value=f"`{len(g.roles)}`", inline=True)
+    await ctx.send(embed=embed, delete_after=30)
+
+@bot.command(name="банлист", aliases=["banlist"])
+async def ban_list(ctx):
+    if not await check_permissions(ctx, "ban"):
+        return
+    
+    try:
+        banned = [e async for e in ctx.guild.bans()]
+        if not banned:
+            embed = await create_info_embed("Список банов", "Нет забаненных пользователей.")
+            await ctx.send(embed=embed, delete_after=10)
+            return
+        
+        embed = disnake.Embed(title="📋 Список забаненных", description=f"Всего: **{len(banned)}**", color=COLOR_ERROR, timestamp=datetime.now())
+        text = ""
+        for i, e in enumerate(banned[:20], 1):
+            reason = e.reason or "Не указана"
+            if ": " in reason:
+                reason = reason.split(": ", 1)[1]
+            text += f"**{i}.** {e.user.name} (ID: {e.user.id})\n   📋 {reason[:50]}\n\n"
+        if len(banned) > 20:
+            text += f"\n*и еще {len(banned)-20}...*"
+        embed.add_field(name="👤 Пользователи", value=text[:1024], inline=False)
+        await ctx.send(embed=embed, delete_after=30)
+    except Exception as e:
+        embed = await create_error_embed("Ошибка", str(e)[:100])
+        await ctx.send(embed=embed, delete_after=10)
+
+@bot.command(name="тест")
+async def test(ctx):
+    await ctx.send("✅ Бот работает! Команда получена.")
+
+# ==================== ЦИКЛИЧЕСКИЕ ЗАДАЧИ ====================
+@tasks.loop(seconds=30)
+async def check_temp_punishments():
+    now = datetime.now().timestamp()
+    
+    mutes = load_temp_data(MUTE_FILE)
+    for uid, data in list(mutes.items()):
+        if now >= data['until']:
+            for guild in bot.guilds:
+                member = guild.get_member(int(uid))
+                if member:
+                    role = disnake.utils.get(guild.roles, name="Muted")
+                    if role and role in member.roles:
+                        await member.remove_roles(role)
+            del mutes[uid]
+            save_temp_data(MUTE_FILE, mutes)
+
+@tasks.loop(seconds=60)
+async def check_temp_warns():
+    now = datetime.now().timestamp()
+    temp_warns = load_temp_warns()
+    
+    for key, data in list(temp_warns.items()):
+        if now >= data['expires_at']:
+            guild_id = data['guild_id']
+            user_id = data['user_id']
+            warn_id = data['warn_id']
+            
+            remove_warn(guild_id, user_id, warn_id)
+            
+            for guild in bot.guilds:
+                if guild.id == guild_id:
+                    member = guild.get_member(user_id)
+                    if member:
+                        embed_dm = disnake.Embed(title="✅ Предупреждение автоматически снято", description=f"На сервере **{guild.name}**", color=COLOR_SUCCESS)
+                        await send_dm(member, embed_dm)
+                    break
+            
+            del temp_warns[key]
+            save_temp_warns(temp_warns)
+
+# ==================== СОБЫТИЯ ====================
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user} запущен!")
+    print(f"📊 На {len(bot.guilds)} серверах")
+    await bot.change_presence(activity=disnake.Game(name=f"{PREFIX}помощь"))
+    check_temp_punishments.start()
+    check_temp_warns.start()
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    embed = await create_error_embed("Ошибка команды", str(error)[:100])
+    await ctx.send(embed=embed, delete_after=10)
+
+# ==================== ЗАПУСК ====================
+if __name__ == "__main__":
+    if not TOKEN:
+        print("=" * 50)
+        print("⚠️ ОШИБКА: Токен не найден!")
+        print("Создайте переменную окружения BOT_TOKEN")
+        print("или вставьте токен в настройках бота на bothost.ru")
+        print("=" * 50)
+    else:
+        bot.run('BOT_TOKEN')
