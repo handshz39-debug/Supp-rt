@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta
 
 # ==================== КОНФИГУРАЦИЯ ====================
-TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_ВСТАВЬТЕ_СЮДА")
+TOKEN = os.getenv("BOT_TOKEN")
 PREFIX = "!"
 
 # Цвета
@@ -25,7 +25,6 @@ TICKETS_FILE = "tickets.json"
 CONFIG_FILE = "bot_config.json"
 WARNS_FILE = "warns.json"
 TEMP_WARNS_FILE = "temp_warns.json"
-TICKET_TRANSCRIPTS_DIR = "ticket_transcripts"
 
 # Настройки
 BLOCKED_ROLE_NAME = "заблокированный доступ"
@@ -33,7 +32,6 @@ WARN_DURATION_HOURS = 1
 
 # ==================== БЕЗОПАСНАЯ РАБОТА С JSON ====================
 def safe_json_load(file_path, default_data=None):
-    """Безопасная загрузка JSON — создаёт файл если его нет или он повреждён"""
     if default_data is None:
         default_data = {}
     
@@ -54,7 +52,6 @@ def safe_json_load(file_path, default_data=None):
         return default_data
 
 def safe_json_save(file_path, data):
-    """Безопасное сохранение JSON"""
     try:
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -62,10 +59,6 @@ def safe_json_save(file_path, data):
     except Exception as e:
         print(f"Ошибка сохранения {file_path}: {e}")
         return False
-
-# Создаём папку для транскриптов
-if not os.path.exists(TICKET_TRANSCRIPTS_DIR):
-    os.makedirs(TICKET_TRANSCRIPTS_DIR)
 
 # Intents
 intents = disnake.Intents.default()
@@ -109,7 +102,7 @@ def set_config_value(key, value):
     save_config(config)
     return value
 
-# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ЗАГРУЗКИ ====================
+# ==================== ФУНКЦИИ ЗАГРУЗКИ ====================
 def load_user_roles():
     return safe_json_load(DATA_FILE, {})
 
@@ -132,7 +125,7 @@ def load_warns():
     return safe_json_load(WARNS_FILE, {})
 
 def save_warns(data):
-    safe_json_save(WARNS_FILE, data)  # Исправлено: было safe_json_sAVE
+    safe_json_save(WARNS_FILE, data)
 
 def load_temp_warns():
     return safe_json_load(TEMP_WARNS_FILE, {})
@@ -198,9 +191,6 @@ def has_ban_permissions(member):
 
 def has_admin_permissions(member):
     return member.guild_permissions.administrator
-
-def can_moderate_ticket(member):
-    return has_moderator_permissions(member)
 
 async def send_dm(user, embed):
     try:
@@ -282,7 +272,7 @@ async def check_permissions(ctx, permission_type: str):
         return False
     return False
 
-# ==================== ФУНКЦИИ ДЛЯ ПРЕДУПРЕЖДЕНИЙ ====================
+# ==================== ПРЕДУПРЕЖДЕНИЯ ====================
 def get_user_warns(guild_id: int, user_id: int):
     warns = load_warns()
     key = f"{guild_id}_{user_id}"
@@ -736,7 +726,6 @@ async def ban_list(ctx):
 
 @bot.command(name="тест")
 async def test(ctx):
-    """Простая тестовая команда для проверки работы бота"""
     await ctx.send("✅ Бот работает! Команда получена.")
 
 # ==================== ЦИКЛИЧЕСКИЕ ЗАДАЧИ ====================
@@ -798,11 +787,11 @@ async def on_command_error(ctx, error):
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
-    if TOKEN == "ВАШ_ТОКЕН_ВСТАВЬТЕ_СЮДА" or TOKEN == "":
+    if not TOKEN:
         print("=" * 50)
-        print("⚠️ ВНИМАНИЕ: Токен не установлен!")
-        print("Установите переменную окружения BOT_TOKEN")
-        print("Или впишите токен в переменную TOKEN в коде")
+        print("⚠️ ОШИБКА: Токен не найден!")
+        print("Создайте переменную окружения BOT_TOKEN")
+        print("или вставьте токен в настройках бота на bothost.ru")
         print("=" * 50)
     else:
-        bot.run(TOKEN)
+        bot.run('BOT_TOKEN')
